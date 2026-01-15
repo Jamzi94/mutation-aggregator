@@ -1,0 +1,9 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "C:/Users/Admin/mutation-aggregator/.venv/Scripts/python.exe": true,
+        "/^cd c:/Users/Admin/mutation-aggregator; C:/Users/Admin/mutation-aggregator/\\.venv/Scripts/python\\.exe -c \"\nimport sqlite3\nconn = sqlite3\\.connect\\('mutation_cache\\.sqlite3'\\)\ncursor = conn\\.execute\\('SELECT key, response FROM cache WHERE key LIKE \\\\\"%efetch%\\\\\" LIMIT 1'\\)\nrow = cursor\\.fetchone\\(\\)\nif row:\n    print\\('Key:', row\\[0\\]\\[:100\\]\\)\n    print\\(\\)\n    print\\('Response \\(first 3000 chars\\):'\\)\n    print\\(row\\[1\\]\\[:3000\\]\\)\n\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
