@@ -500,15 +500,53 @@ class MutationAggregator:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Aggregate mutation data for a given UniProt ID")
-    parser.add_argument("uniprot_id", help="UniProt accession (e.g., P38398)")
+    parser = argparse.ArgumentParser(description="Aggregate mutation data for UniProt IDs")
+    parser.add_argument("uniprot_id", nargs="?", help="UniProt accession (e.g., P38398)")
+    parser.add_argument("--batch", help="CSV file with 'uniprot_id' column for batch processing")
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="YAML config path")
     parser.add_argument("--no-write", action="store_true", help="Do not write outputs to disk")
     args = parser.parse_args()
+
+    if not args.uniprot_id and not args.batch:
+        parser.error("Either provide a uniprot_id or use --batch with a CSV file")
+
     cfg = load_config(args.config)
     agg = MutationAggregator(cfg)
-    df = agg.analyze_uniprot_mutations(args.uniprot_id, write_outputs=not args.no_write)
-    print(df.to_string(index=False))
+
+    if args.batch:
+        # Batch mode: read CSV and process each UniProt ID
+        logger.info("Batch mode: reading UniProt IDs from %s", args.batch)
+        try:
+            batch_df = pd.read_csv(args.batch)
+            if "uniprot_id" not in batch_df.columns:
+                logger.error("CSV must have a 'uniprot_id' column")
+                return
+            uniprot_ids = batch_df["uniprot_id"].dropna().unique().tolist()
+            logger.info("Found %d UniProt IDs to process", len(uniprot_ids))
+            
+            all_results = []
+            for uid in tqdm(uniprot_ids, desc="Processing UniProt IDs"):
+                try:
+                    df = agg.analyze_uniprot_mutations(uid, write_outputs=not args.no_write)
+                    df["batch_uniprot_id"] = uid
+                    all_results.append(df)
+                    logger.info("Completed %s: %d mutations", uid, len(df))
+                except Exception as e:
+                    logger.exception("Failed to process %s: %s", uid, e)
+            
+            # Create combined summary
+            if all_results and not args.no_write:
+                combined_df = pd.concat(all_results, ignore_index=True)
+                summary_path = os.path.join(agg.output_dir, "batch_summary.xlsx")
+                combined_df.to_excel(summary_path, index=False)
+                logger.info("Wrote batch summary: %s", summary_path)
+                print(f"Batch complete: {len(uniprot_ids)} IDs processed, {len(combined_df)} total mutations")
+        except Exception as e:
+            logger.exception("Batch processing failed: %s", e)
+    else:
+        # Single ID mode
+        df = agg.analyze_uniprot_mutations(args.uniprot_id, write_outputs=not args.no_write)
+        print(df.to_string(index=False))
 
 
 if __name__ == "__main__":
