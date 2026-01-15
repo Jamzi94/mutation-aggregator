@@ -1,0 +1,10 @@
+api_keys: {}
+http_client:
+  retries: 4
+  backoff_factor: 0.7
+  rate_limits:
+    rest.uniprot.org: 3
+    eutils.ncbi.nlm.nih.gov: 3
+cache_db: "mutation_cache.sqlite3"
+output_dir: "outputs"
+max_workers: 6
