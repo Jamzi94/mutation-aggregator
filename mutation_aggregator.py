@@ -288,27 +288,53 @@ THREE_TO_ONE = {v.capitalize(): k for k, v in AA_1TO3.items()}
 def parse_uniprot_variant(variant_feature: Dict[str, Any]) -> Optional[MutationRecord]:
     try:
         description = variant_feature.get("description") or ""
-        original = variant_feature.get("original")
-        variation = variant_feature.get("variation")
         pos = None
         ref = None
         alt = None
-        if original and variation and isinstance(variation, str):
-            try:
-                pos = int(variant_feature.get("location", {}).get("start"))
-            except Exception:
-                pos = None
-            ref = original
-            alt = variation
-        else:
+        
+        # Extract position from location.start.value (UniProt format)
+        location = variant_feature.get("location", {})
+        start_obj = location.get("start", {})
+        if isinstance(start_obj, dict):
+            pos = start_obj.get("value")
+        elif isinstance(start_obj, int):
+            pos = start_obj
+        
+        # Extract ref/alt from alternativeSequence
+        alt_seq = variant_feature.get("alternativeSequence", {})
+        if alt_seq:
+            ref = alt_seq.get("originalSequence")
+            alt_list = alt_seq.get("alternativeSequences", [])
+            alt = alt_list[0] if alt_list else None
+        
+        # Fallback to old format
+        if not ref:
+            ref = variant_feature.get("original")
+        if not alt:
+            variation = variant_feature.get("variation")
+            if isinstance(variation, str):
+                alt = variation
+        
+        # Fallback: parse from description
+        if pos is None:
             m = AA_REGEX.search(description)
             if m:
                 ref3, pos_str, alt3 = m.groups()
                 pos = int(pos_str)
-                ref = THREE_TO_ONE.get(ref3.capitalize(), ref3)
-                alt = THREE_TO_ONE.get(alt3.capitalize(), alt3) if alt3 != "=" else None
+                if not ref:
+                    ref = THREE_TO_ONE.get(ref3.capitalize(), ref3)
+                if not alt:
+                    alt = THREE_TO_ONE.get(alt3.capitalize(), alt3) if alt3 != "=" else None
+        
+        # Extract PubMed IDs from evidences
+        pubmed_ids = []
+        for ev in variant_feature.get("evidences", []):
+            if ev.get("source") == "PubMed" and ev.get("id"):
+                pubmed_ids.append(ev.get("id"))
+        
         mod_type = variant_feature.get("type") or "variant"
         validation = "experimental" if variant_feature.get("evidences") else None
+        
         return MutationRecord(
             position_aa=pos,
             ref_residue=ref,
@@ -320,8 +346,8 @@ def parse_uniprot_variant(variant_feature: Dict[str, Any]) -> Optional[MutationR
             validation_status=validation,
             clinvar_id=None,
             uniprot_variant_id=variant_feature.get("id"),
-            pubmed_references=[],
-            structural_context=None,
+            pubmed_references=[{"pmid": pmid} for pmid in pubmed_ids],
+            structural_context=description,
             raw_sources={"uniprot_feature": variant_feature},
         )
     except Exception as e:
@@ -394,13 +420,15 @@ def normalize_records_from_sources(uniprot_json: Dict[str, Any], clinical: List[
                 uniprot_variant_id=None,
                 pubmed_references=[],
                 structural_context=None,
-                raw_sources={"clinvar": item},
+                raw_sources={"clinvar": [item]},
             )
         else:
             rec = records[key]
             if "ClinVar" not in rec.source_databases:
                 rec.source_databases.append("ClinVar")
-            rec.raw_sources.setdefault("clinvar", []).append(item)
+            if "clinvar" not in rec.raw_sources:
+                rec.raw_sources["clinvar"] = []
+            rec.raw_sources["clinvar"].append(item)
 
     for ref in references:
         for rec in records.values():
@@ -455,23 +483,36 @@ class MutationAggregator:
 
         df_rows = []
         for key, rec in records.items():
+            # Format mutation as REF→ALT
+            mutation_str = ""
+            if rec.ref_residue and rec.alt_residue:
+                mutation_str = f"{rec.ref_residue}→{rec.alt_residue}"
+            elif rec.ref_residue:
+                mutation_str = f"{rec.ref_residue}→?"
+            elif rec.alt_residue:
+                mutation_str = f"?→{rec.alt_residue}"
+            
+            # Extract PubMed IDs
+            pubmed_ids = []
+            for ref in (rec.pubmed_references or []):
+                if isinstance(ref, dict):
+                    pmid = ref.get("pmid") or ref.get("uid")
+                    if pmid:
+                        pubmed_ids.append(str(pmid))
+            
             df_rows.append(
                 {
-                    "key": key,
-                    "position_aa": rec.position_aa,
-                    "ref_residue": rec.ref_residue,
-                    "alt_residue": rec.alt_residue,
-                    "modification_type": rec.modification_type,
-                    "impact_category": rec.impact_category,
-                    "impact_score": rec.impact_score,
-                    "source_databases": ",".join(sorted(set(rec.source_databases))),
-                    "validation_status": rec.validation_status,
+                    "uniprot_id": uniprot_id,
+                    "position": rec.position_aa,
+                    "mutation": mutation_str,
+                    "type": rec.modification_type,
+                    "impact": rec.impact_category,
+                    "sources": ",".join(sorted(set(rec.source_databases))),
+                    "validation": rec.validation_status,
+                    "description": rec.structural_context,
+                    "pubmed_ids": ",".join(sorted(set(pubmed_ids))) if pubmed_ids else None,
                     "clinvar_id": rec.clinvar_id,
                     "uniprot_variant_id": rec.uniprot_variant_id,
-                    "pubmed_references_count": len(rec.pubmed_references or []),
-                    "structural_context": rec.structural_context,
-                    "raw_sources": rec.raw_sources,
-                    "flags": None,
                 }
             )
 
