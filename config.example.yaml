@@ -112,3 +112,4 @@ limits:
   pharmgkb_connected_variants: 20        # Limite variants connectés PharmGKB
   pharmgkb_clinical_annotations: 30      # Limite annotations cliniques PharmGKB
   pharmgkb_variant_annotations: 50       # Limite annotations de variants PharmGKB
+  worker_timeout: 120                    # Timeout (s) pour chaque tâche d'API dans ThreadPoolExecutor (0=infini)

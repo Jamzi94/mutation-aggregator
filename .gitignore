@@ -1,0 +1,17 @@
+# Virtual environment
+.venv/
+
+# Outputs and caches
+outputs/
+mutation_cache.sqlite3
+mutation_aggregator.log
+
+# Local config
+config.yaml
+
+# Python cache
+__pycache__/
+*.pyc
+
+# VSCode settings (optional)
+.vscode/

@@ -15,7 +15,7 @@ import sqlite3
 import threading
 import time
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
@@ -565,14 +565,20 @@ class HTTPClient:
 
 class BaseAdapter(ABC):
     def __init__(self, client: HTTPClient, cache: Cache, config: Dict, uid_context: str = ""):
+        # Client HTTP, cache et config partagés
         self.client, self.cache, self.config = client, cache, config
         self.log = logger.getChild(self.__class__.__name__)
         self.uid_context = uid_context
+        # Pré-calculs depuis la config pour éviter les appels répétés
+        self.fetch_all = bool(self.config.get("sources", {}).get("fetch_all", False))
+        self.limits = self.config.get("limits", {})
+        self.batch_size = self.limits.get("batch_size", 20)
 
     def _log(self, level, msg, *args, **kwargs):
         self.log.log(level, msg, *args, extra={'uid': self.uid_context}, **kwargs)
 
     def _fetch(self, url: str, params: Dict = None) -> Any:
+        """Fetch + cache wrapper avec logging centralisé."""
         cached = self.cache.get(url, params)
         if cached is not None: return cached
         try:
@@ -582,6 +588,28 @@ class BaseAdapter(ABC):
         except Exception as e:
             self._log(logging.WARNING, "Fetch failed %s: %s", url, e)
             return None
+
+    # Helper utilitaires
+    def get_limit(self, name: str, default: int) -> Optional[int]:
+        """Retourne la limite configurée ou None si fetch_all est activé."""
+        if self.fetch_all:
+            return None
+        return self.limits.get(name, default)
+
+    def slice_items(self, items: List[Any], limit_name: str, default: int) -> List[Any]:
+        """Retourne la liste tronquée si nécessaire en fonction des limites."""
+        if items is None:
+            return []
+        limit = self.get_limit(limit_name, default)
+        return list(items) if limit is None else list(items)[:limit]
+
+    def make_record(self, source: str, **kwargs) -> MutationRecord:
+        """Constructeur simplifié de MutationRecord (centralise source et raw_sources)."""
+        sources = kwargs.pop('source_databases', [source])
+        raw = kwargs.pop('raw_sources', {})
+        rec = MutationRecord(source_databases=sources, raw_sources=raw, **kwargs)
+        rec.init_tracking(source)
+        return rec
 
     @abstractmethod
     def fetch_data(self, uniprot_id: str, gene_symbol: str = None) -> List[MutationRecord]: pass
@@ -612,11 +640,11 @@ class UniProtAdapter(BaseAdapter):
             rsid = VariantParser.parse_rsid(description)
             
             pmids = [str(e["id"]) for e in feat.get("evidences", []) if e.get("source") == "PubMed" and e.get("id")]
-            records.append(MutationRecord(
+            records.append(self.make_record(
+                "UniProt",
                 uniprot_id=uniprot_id, position_aa=pos, ref_residue=ref, alt_residue=alt,
                 modification_type=feat.get("type", "variant"), 
                 impact_category="high" if pmids else None,
-                source_databases=["UniProt"], 
                 validation_status="experimental" if pmids else None,
                 pubmed_refs=pmids, 
                 description=description, 
@@ -660,17 +688,14 @@ class ClinVarAdapter(BaseAdapter):
             known_rsids: Liste de rsIDs connus d'UniProt
         """
         uids = set()
-        limits = self.config.get("limits", {})
-        batch_size = limits.get("batch_size", 20)
         
         # fetch_all global: récupère tous les variants (ignore les limites)
-        fetch_all = self.config.get("sources", {}).get("fetch_all", False)
-        search_limit = 100000 if fetch_all else limits.get("clinvar_search_limit", 200)
+        search_limit = 100000 if self.fetch_all else self.get_limit("clinvar_search_limit", 200)
         
         # 1. Recherche par rsIDs connus en batch (prioritaire - meilleure corrélation)
         if known_rsids:
-            for i in range(0, len(known_rsids), batch_size):
-                batch = known_rsids[i:i+batch_size]
+            for i in range(0, len(known_rsids), self.batch_size):
+                batch = known_rsids[i:i+self.batch_size]
                 rs_terms = " OR ".join(f"rs{rsid.replace('rs', '')}[All Fields]" for rsid in batch if rsid)
                 if rs_terms:
                     data = self._fetch(f"{self.BASE_URL}/esearch.fcgi",
@@ -690,22 +715,35 @@ class ClinVarAdapter(BaseAdapter):
             return []
         
         self._log(logging.INFO, "ClinVar UIDs found: %d", len(uids))
-        clinvar_limit = None if fetch_all else limits.get("clinvar_max_records", 50)
-        uid_list = list(uids) if fetch_all else list(uids)[:clinvar_limit]
+        clinvar_limit = self.get_limit("clinvar_max_records", 50)
+        uid_list = list(uids) if clinvar_limit is None else list(uids)[:clinvar_limit]
         
-        # Utiliser esummary en batch (plus efficace et fiable)
+        # Utiliser esummary en batch (paralléliser les requêtes par petits lots)
         records = []
-        for i in range(0, len(uid_list), batch_size):
-            batch = uid_list[i:i+batch_size]
-            summary = self._fetch(f"{self.BASE_URL}/esummary.fcgi", 
-                                 {"db": "clinvar", "id": ",".join(batch), "retmode": "json"})
-            if summary and "result" in summary:
-                for uid in batch:
-                    if uid in summary["result"]:
-                        rec = self._parse_summary(summary["result"][uid], uid, uniprot_id)
-                        if rec:
-                            records.append(rec)
-        
+        batch_calls = []
+        for i in range(0, len(uid_list), self.batch_size):
+            batch = uid_list[i:i+self.batch_size]
+            batch_calls.append((batch, {"db": "clinvar", "id": ",".join(batch), "retmode": "json"}))
+
+        if batch_calls:
+            inner_workers = min(2, self.limits.get('max_workers', 4))
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=inner_workers) as rex:
+                fut_map = {rex.submit(self._fetch, f"{self.BASE_URL}/esummary.fcgi", params): batch for (batch, params) in batch_calls}
+                for fut in as_completed(fut_map):
+                    batch = fut_map[fut]
+                    try:
+                        summary = fut.result()
+                    except Exception:
+                        self._log(logging.WARNING, "ClinVar: esummary fetch failed for batch")
+                        continue
+                    if summary and "result" in summary:
+                        for uid in batch:
+                            if uid in summary["result"]:
+                                rec = self._parse_summary(summary["result"][uid], uid, uniprot_id)
+                                if rec:
+                                    records.append(rec)
+
         self._log(logging.INFO, "ClinVar records parsed: %d", len(records))
         return records
 
@@ -815,14 +853,14 @@ class ClinVarAdapter(BaseAdapter):
         if splice_impact and "canonical" in splice_impact.lower():
             desc_parts.append(f"⚠️ {splice_impact}")
         
-        return MutationRecord(
+        return self.make_record(
+            "ClinVar",
             uniprot_id=uniprot_id,
-            position_aa=pos, 
-            ref_residue=ref, 
+            position_aa=pos,
+            ref_residue=ref,
             alt_residue=alt,
             modification_type=variant_type if variant_type != "variant" else "clinical",
             impact_category=VariantParser.impact_from_significance(sig),
-            source_databases=["ClinVar"],
             validation_status=sig,
             clinvar_ids=[accession],
             pubmed_refs=[],  # esummary ne contient pas les PMIDs directement
@@ -890,12 +928,10 @@ class PharmGKBAdapter(BaseAdapter):
         self._log(logging.INFO, "PharmGKB Gene ID: %s (symbol: %s)", pharmgkb_gene_id, gene_symbol)
         
         # Limites configurables (fetch_all = pas de limite)
-        limits = self.config.get("limits", {})
-        fetch_all = self.config.get("sources", {}).get("fetch_all", False)
-        
-        limit_connected = None if fetch_all else limits.get("pharmgkb_connected_variants", 20)
-        limit_clinical = None if fetch_all else limits.get("pharmgkb_clinical_annotations", 30)
-        limit_variant = None if fetch_all else limits.get("pharmgkb_variant_annotations", 50)
+        limits = self.limits
+        limit_connected = self.get_limit("pharmgkb_connected_variants", 20)
+        limit_clinical = self.get_limit("pharmgkb_clinical_annotations", 30)
+        limit_variant = self.get_limit("pharmgkb_variant_annotations", 50)
         
         # 2. Variants Connectés au gène (via /report/connectedObjects)
         connected = self._fetch(f"{self.BASE_URL}/report/connectedObjects/{pharmgkb_gene_id}/Variant")
@@ -903,23 +939,36 @@ class PharmGKBAdapter(BaseAdapter):
             connected_list = self._extract_data(connected) if isinstance(connected, dict) else connected
             self._log(logging.INFO, "PharmGKB Connected Variants: %d", len(connected_list) if connected_list else 0)
             
-            # Pour chaque variant connecté, récupérer les détails
-            items = (connected_list or [])[:limit_connected] if limit_connected else (connected_list or [])
+            # Pour chaque variant connecté, récupérer les détails (paralléliser les fetchs pour accélérer)
+            items = self.slice_items(connected_list, 'pharmgkb_connected_variants', 20)
+            rs_tasks = []
             for conn in items:
                 var_obj = conn.get('connectedObject', {})
                 rsid = var_obj.get('symbol', '')
                 conn_types = conn.get('connectionTypes', [])
-                
                 if rsid and rsid.startswith('rs'):
-                    # Récupérer les détails du variant
-                    var_details = self._fetch(f"{self.BASE_URL}/data/variant/", {"symbol": rsid, "view": "max"})
-                    if var_details:
-                        var_list = self._extract_data(var_details)
-                        if var_list and isinstance(var_list, list):
-                            var = var_list[0]
-                            rec = self._parse_variant(var, uniprot_id, conn_types)
-                            if rec:
-                                records.append(rec)
+                    rs_tasks.append((rsid, conn_types))
+
+            if rs_tasks:
+                # Limiter le parallélisme interne pour respecter les rate limits
+                inner_workers = min(4, self.limits.get('max_workers', 4))
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                with ThreadPoolExecutor(max_workers=inner_workers) as rex:
+                    f_map = {rex.submit(self._fetch, f"{self.BASE_URL}/data/variant/", {"symbol": rsid, "view": "max"}): (rsid, ct) for rsid, ct in rs_tasks}
+                    for fut in as_completed(f_map):
+                        rsid, conn_types = f_map[fut]
+                        try:
+                            var_details = fut.result()
+                        except Exception:
+                            self._log(logging.WARNING, "PharmGKB variant fetch failed for %s", rsid)
+                            continue
+                        if var_details:
+                            var_list = self._extract_data(var_details)
+                            if var_list and isinstance(var_list, list):
+                                var = var_list[0]
+                                rec = self._parse_variant(var, uniprot_id, conn_types)
+                                if rec:
+                                    records.append(rec)
         
         # 3. Annotations Cliniques par Gene ID PharmGKB (niveau de preuve par médicament)
         clinical_anns = self._fetch(f"{self.BASE_URL}/data/clinicalAnnotation", 
@@ -929,11 +978,20 @@ class PharmGKBAdapter(BaseAdapter):
             self._log(logging.INFO, "PharmGKB Clinical Annotations: %d", len(ann_list) if ann_list else 0)
             
             # Parser les annotations pour extraire les variants spécifiques
-            clinical_items = (ann_list or [])[:limit_clinical] if limit_clinical else (ann_list or [])
-            for ann in clinical_items:
-                rec = self._parse_clinical_annotation(ann, uniprot_id)
-                if rec:
-                    records.append(rec)
+            clinical_items = self.slice_items(ann_list, 'pharmgkb_clinical_annotations', 30)
+            if clinical_items:
+                inner_workers = min(4, self.limits.get('max_workers', 4))
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                with ThreadPoolExecutor(max_workers=inner_workers) as rex:
+                    futs = {rex.submit(self._parse_clinical_annotation, ann, uniprot_id): ann for ann in clinical_items}
+                    for fut in as_completed(futs):
+                        try:
+                            rec = fut.result()
+                            if rec:
+                                records.append(rec)
+                        except Exception:
+                            self._log(logging.WARNING, "PharmGKB: parsing clinical annotation failed")
+            
         
         # 4. Annotations de Variants par Gene ID PharmGKB (plus détaillées)
         var_anns = self._fetch(f"{self.BASE_URL}/data/variantAnnotation", 
@@ -943,22 +1001,30 @@ class PharmGKBAdapter(BaseAdapter):
             self._log(logging.INFO, "PharmGKB Variant Annotations: %d", len(vann_list) if vann_list else 0)
             
             # Parser les annotations avec positions protéiques
-            variant_items = (vann_list or [])[:limit_variant] if limit_variant else (vann_list or [])
-            for vann in variant_items:
-                rec = self._parse_variant_annotation(vann, uniprot_id)
-                if rec:
-                    records.append(rec)
+            variant_items = self.slice_items(vann_list, 'pharmgkb_variant_annotations', 50)
+            if variant_items:
+                inner_workers = min(4, self.limits.get('max_workers', 4))
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                with ThreadPoolExecutor(max_workers=inner_workers) as rex:
+                    futs = {rex.submit(self._parse_variant_annotation, vann, uniprot_id): vann for vann in variant_items}
+                    for fut in as_completed(futs):
+                        try:
+                            rec = fut.result()
+                            if rec:
+                                records.append(rec)
+                        except Exception:
+                            self._log(logging.WARNING, "PharmGKB: parsing variant annotation failed")
         
         # 5. Record Global d'enrichissement (niveau de preuve du gène)
         best_level = self._get_best_evidence_level(ann_list if clinical_anns else [])
         guideline_names = self._get_guideline_names(pharmgkb_gene_id)
         
         global_desc = f"PharmGKB Gene Lvl {best_level}. Guidelines: {guideline_names or 'None'}"
-        global_record = MutationRecord(
-            uniprot_id=uniprot_id, 
-            position_aa=None, 
-            source_databases=["PharmGKB"],
-            description=global_desc, 
+        global_record = self.make_record(
+            "PharmGKB",
+            uniprot_id=uniprot_id,
+            position_aa=None,
+            description=global_desc,
             impact_category=self._map_level_to_impact(best_level)
         )
         records.append(global_record)
@@ -995,14 +1061,14 @@ class PharmGKBAdapter(BaseAdapter):
         if connection_types:
             desc += f" [{', '.join(connection_types)}]"
         
-        return MutationRecord(
+        return self.make_record(
+            "PharmGKB",
             uniprot_id=uniprot_id,
             position_aa=pos,
             ref_residue=ref,
             alt_residue=alt,
             rsid=rsid,
             modification_type=change_class.lower() if change_class else "variant",
-            source_databases=["PharmGKB"],
             description=desc,
             impact_category=impact,
             raw_sources={"pharmgkb_variant": var.get('id')}
@@ -1299,6 +1365,7 @@ class MutationAggregator:
         
         external_data = {}
         max_w = self.config.get("limits", {}).get("max_workers", 4)
+        worker_timeout = self.config.get("limits", {}).get("worker_timeout", 120)
         with ThreadPoolExecutor(max_workers=max_w) as ex:
             futures = {}
             if "clinvar" in adapters:
@@ -1310,9 +1377,19 @@ class MutationAggregator:
             
             for fut in as_completed(futures):
                 name = futures[fut]
-                try: external_data[name] = fut.result()
+                try:
+                    # Timeout configurable pour éviter blocage infini sur une source
+                    if worker_timeout and worker_timeout > 0:
+                        external_data[name] = fut.result(timeout=worker_timeout)
+                    else:
+                        external_data[name] = fut.result()
                 except Exception as e:
-                    run_logger.error("Error in %s: %s", name, e)
+                    if isinstance(e, TimeoutError):
+                        run_logger.error("Timeout (%ss) in %s, cancelling task", worker_timeout, name)
+                        try: fut.cancel()
+                        except: pass
+                    else:
+                        run_logger.error("Error in %s: %s", name, e)
                     external_data[name] = []
 
         # 3. Corrélation Multi-Sources avec Index Multi-Clé
